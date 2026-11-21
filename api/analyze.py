@@ -40,32 +40,46 @@ Policy text (truncated):
                 "responseMimeType": "application/json"
             }
         }
-        resp = requests.post(url, json=body, timeout=20)
+        resp = requests.post(url, json=body, timeout=12)
         if resp.status_code != 200:
             return nlp_result
 
         data = resp.json()
-        content = (
-            data.get("candidates", [{}])[0]
-            .get("content", {})
-            .get("parts", [{}])[0]
-            .get("text", "")
-        )
-        content = re.sub(r"^```json\s*|\s*```$", "", content.strip())
-        ai_data = json.loads(content)
+        candidates = data.get("candidates") or []
+        parts = (candidates[0].get("content") or {}).get("parts") or [] if candidates else []
+        raw_text = (parts[0].get("text") or "").strip() if parts else ""
+        if not raw_text:
+            return nlp_result
+
+        cleaned_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.IGNORECASE).strip()
+        ai_data = json.loads(cleaned_json)
+        if not isinstance(ai_data, dict):
+            return nlp_result
 
         nlp_result["engine"] = f"Hybrid NLP + Gemini ({model})"
-        if ai_data.get("ai_summary"):
-            nlp_result["summary"] = ai_data["ai_summary"]
-        if ai_data.get("extra_risks"):
-            for risk in ai_data["extra_risks"][:3]:
-                nlp_result["findings"].append({
-                    "category": "AI Contextual Insight",
-                    "status": "Insight",
-                    "weight_added": 0,
-                    "message": risk,
-                    "evidence": "AI semantic analysis"
-                })
+
+        ai_summary = ai_data.get("ai_summary")
+        if isinstance(ai_summary, str) and ai_summary.strip():
+            nlp_result["summary"] = ai_summary.strip()
+
+        confidence = ai_data.get("confidence")
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool):
+            nlp_result["ai_confidence"] = max(0, min(100, round(confidence)))
+
+        extra_risks = ai_data.get("extra_risks")
+        if isinstance(extra_risks, list):
+            findings = list(nlp_result.get("findings") or [])
+            for risk in extra_risks[:3]:
+                if isinstance(risk, str) and risk.strip():
+                    findings.append({
+                        "category": "AI Contextual Insight",
+                        "status": "Insight",
+                        "weight_added": 0,
+                        "message": risk.strip(),
+                        "evidence": "AI semantic analysis"
+                    })
+            nlp_result["findings"] = findings
+
         return nlp_result
     except Exception:
         return nlp_result
@@ -77,27 +91,33 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Methods", "POST, OPTIONS, GET")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
+    def _send_json(self, status_code: int, payload: dict):
+        self.send_response(status_code)
+        self.send_header("Content-type", "application/json; charset=utf-8")
+        self._set_cors()
+        self.end_headers()
+        self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
     def do_OPTIONS(self):
         self.send_response(204)
         self._set_cors()
         self.end_headers()
 
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "application/json")
-        self._set_cors()
-        self.end_headers()
-        self.wfile.write(json.dumps({
+        self._send_json(200, {
             "status": "ok",
             "service": "Privacy Policy Analyzer",
             "message": "POST /api/analyze with {mode, content}"
-        }).encode())
+        })
 
     def do_POST(self):
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
         try:
+            content_length = max(0, int(self.headers.get("Content-Length") or 0))
+            raw = self.rfile.read(content_length) if content_length else b"{}"
             payload = json.loads(raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid request format.")
+
             mode = payload.get("mode", "text")
             content = (payload.get("content") or "").strip()
 
@@ -116,16 +136,7 @@ class handler(BaseHTTPRequestHandler):
 
             result = analyze_nlp(extracted)
             result = try_ai_enrichment(extracted, result)
-
-            self.send_response(200)
-            self.send_header("Content-type", "application/json; charset=utf-8")
-            self._set_cors()
-            self.end_headers()
-            self.wfile.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+            self._send_json(200, result)
 
         except Exception as e:
-            self.send_response(400)
-            self.send_header("Content-type", "application/json; charset=utf-8")
-            self._set_cors()
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": str(e)}, ensure_ascii=False).encode("utf-8"))
+            self._send_json(400, {"error": str(e)})
