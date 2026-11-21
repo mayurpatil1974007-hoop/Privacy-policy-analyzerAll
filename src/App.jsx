@@ -3,7 +3,7 @@ import React, { useState, useRef } from 'react'
 const MODES = [
   { id: 'url', label: 'Website URL' },
   { id: 'text', label: 'Paste Text' },
-  { id: 'pdf', label: 'PDF Upload' },
+  { id: 'pdf', label: 'PDF / File Upload' },
   { id: 'image', label: 'Photo / OCR' }
 ]
 
@@ -61,6 +61,16 @@ export default function App() {
       fullText += strings.join(' ') + '\n'
     }
     return fullText.trim()
+  }
+
+  const extractTextFile = async (file) => {
+    const raw = await file.text()
+    if (file.name.toLowerCase().endsWith('.html') || file.type === 'text/html') {
+      const doc = new DOMParser().parseFromString(raw, 'text/html')
+      doc.querySelectorAll('script, style, noscript').forEach((el) => el.remove())
+      return (doc.body?.textContent || '').replace(/\s+/g, ' ').trim()
+    }
+    return raw.trim()
   }
 
   const extractImageText = async (file) => {
@@ -133,12 +143,22 @@ export default function App() {
     setLoading(true)
     try {
       let text = ''
+      const lower = file.name.toLowerCase()
       if (mode === 'pdf') {
-        if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
-          throw new Error('Please select a valid PDF file.')
+        if (file.type === 'application/pdf' || lower.endsWith('.pdf')) {
+          setStatus('Extracting text from PDF…')
+          text = await extractPdfText(file)
+        } else if (
+          file.type.startsWith('text/') ||
+          lower.endsWith('.txt') ||
+          lower.endsWith('.md') ||
+          lower.endsWith('.html')
+        ) {
+          setStatus('Reading text from file…')
+          text = await extractTextFile(file)
+        } else {
+          throw new Error('Please select a PDF, TXT, MD, or HTML file.')
         }
-        setStatus('Extracting text from PDF…')
-        text = await extractPdfText(file)
       } else {
         if (!file.type.startsWith('image/')) {
           throw new Error('Please select an image (JPG, PNG, WEBP).')
@@ -146,7 +166,7 @@ export default function App() {
         text = await extractImageText(file)
       }
       if (!text || text.length < 30) {
-        throw new Error('Could not extract enough text from this file. Try a clearer image or different PDF.')
+        throw new Error('Could not extract enough text from this file. Try pasting text or a clearer file.')
       }
       setInput(text)
       setStatus('Text extracted. Ready to analyze.')
@@ -159,63 +179,38 @@ export default function App() {
     }
   }
 
-  const downloadReport = () => {
-    if (!result) return
-    const lines = []
-    lines.push(`# Privacy Policy Report`)
-    lines.push(``)
-    lines.push(`**Verdict:** ${result.verdict}`)
-    lines.push(`**Risk Score:** ${result.risk_score} / 100`)
-    lines.push(`**Level:** ${result.level}`)
-    lines.push(`**Summary:** ${result.summary}`)
-    lines.push(``)
-    lines.push(`## Key Stats`)
-    lines.push(`- Words: ${result.word_count}`)
-    lines.push(`- Sentences analyzed: ${result.sentences_analyzed}`)
-    lines.push(`- Coverage: ${result.text_coverage_percent}%`)
-    lines.push(`- Engine: ${result.engine || 'Hybrid NLP'}`)
-    lines.push(``)
-    if (result.data_usage?.length) {
-      lines.push(`## Where & How Data Is Used`)
-      result.data_usage.forEach((d) => {
-        lines.push(`### ${d.destination}${d.negated ? ' (Restricted)' : ''}`)
-        lines.push(`- Tag: ${d.where_tag}`)
-        lines.push(`- Purpose: ${d.purpose}`)
-        lines.push(`- Evidence: "${d.evidence}"`)
-        lines.push(``)
-      })
+  const handleDownloadPdf = () => {
+    const prevTitle = document.title
+    if (result) {
+      document.title = `Privacy-Policy-Report-${result.level}-${result.risk_score}`
     }
-    if (result.findings?.length) {
-      lines.push(`## Risk Findings`)
-      result.findings.forEach((f) => {
-        lines.push(`### ${f.category} — ${f.status} (weight +${f.weight_added})`)
-        lines.push(`${f.message}`)
-        lines.push(`Evidence: "${f.evidence}"`)
-        lines.push(``)
-      })
-    }
-    if (result.user_advice?.length) {
-      lines.push(`## Recommended Actions`)
-      result.user_advice.forEach((a) => lines.push(`- ${a}`))
-      lines.push(``)
-    }
-    lines.push(`---`)
-    lines.push(result.disclaimer || 'This is not legal advice.')
+    window.print()
+    setTimeout(() => {
+      document.title = prevTitle
+    }, 500)
+  }
 
-    const blob = new Blob([lines.join('\n')], { type: 'text/markdown;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `privacy-policy-report-${result.level.toLowerCase()}-${Date.now()}.md`
-    a.click()
-    URL.revokeObjectURL(url)
+  const switchMode = (nextMode) => {
+    setMode(nextMode)
+    setInput('')
+    setFileName('')
+    setResult(null)
+    setError('')
+    setStatus('')
   }
 
   const styles = result ? getLevelStyles(result.level) : null
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 via-white to-slate-100/80 text-slate-900">
-      <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8 sm:py-12">
+    <div className="min-h-screen bg-gradient-to-b from-slate-50 via-white to-slate-100/80 text-slate-900 print:bg-white">
+      <style>{`
+        @media print {
+          .no-print { display: none !important; }
+          body { background: #ffffff !important; }
+        }
+      `}</style>
+
+      <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8 sm:py-12 print:py-4">
         {/* Header */}
         <header className="text-center mb-10 no-print">
           <div className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-full bg-sky-50 border border-sky-200/80 text-sky-700 text-xs font-semibold tracking-wide mb-4 shadow-2xs">
@@ -241,14 +236,7 @@ export default function App() {
               <button
                 key={m.id}
                 type="button"
-                onClick={() => {
-                  setMode(m.id)
-                  setInput('')
-                  setFileName('')
-                  setResult(null)
-                  setError('')
-                  setStatus('')
-                }}
+                onClick={() => switchMode(m.id)}
                 className={`px-4 py-2 rounded-xl text-sm font-semibold transition cursor-pointer ${
                   mode === m.id
                     ? 'bg-slate-900 text-white shadow-sm'
@@ -288,10 +276,10 @@ export default function App() {
                 className="border-2 border-dashed border-slate-300 hover:border-sky-500 rounded-2xl p-8 text-center cursor-pointer transition bg-slate-50/80 hover:bg-sky-50/40"
               >
                 <p className="text-slate-800 font-semibold">
-                  {mode === 'pdf' ? 'Drop PDF or click to select' : 'Drop image or click to select'}
+                  {mode === 'pdf' ? 'Drop PDF / text file or click to select' : 'Drop image or click to select'}
                 </p>
                 <p className="text-xs text-slate-500 mt-1">
-                  {mode === 'pdf' ? 'PDF text extraction' : 'JPG, PNG, WEBP — OCR powered'}
+                  {mode === 'pdf' ? 'PDF, TXT, MD, or HTML text extraction' : 'JPG, PNG, WEBP — OCR powered'}
                 </p>
                 {fileName && (
                   <p className="mt-3 text-sm text-sky-700 font-semibold">{fileName}</p>
@@ -300,7 +288,7 @@ export default function App() {
               <input
                 ref={fileRef}
                 type="file"
-                accept={mode === 'pdf' ? 'application/pdf' : 'image/*'}
+                accept={mode === 'pdf' ? '.pdf,.txt,.md,.html,application/pdf,text/*' : 'image/*'}
                 onChange={handleFile}
                 className="hidden"
               />
@@ -322,8 +310,26 @@ export default function App() {
           </button>
 
           {error && (
-            <div className="mt-4 p-4 rounded-2xl bg-red-50 border border-red-200 text-red-700 text-sm font-medium">
-              {error}
+            <div className="mt-4 p-4 rounded-2xl bg-red-50 border border-red-200 text-red-700 text-sm font-medium space-y-2.5">
+              <p>{error}</p>
+              {mode === 'url' && (
+                <div className="flex flex-wrap gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => switchMode('text')}
+                    className="px-3 py-1.5 rounded-lg bg-white hover:bg-red-100/60 text-red-800 text-xs font-semibold border border-red-200 transition cursor-pointer"
+                  >
+                    Paste Policy Text Instead
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => switchMode('pdf')}
+                    className="px-3 py-1.5 rounded-lg bg-white hover:bg-red-100/60 text-red-800 text-xs font-semibold border border-red-200 transition cursor-pointer"
+                  >
+                    Upload PDF / File Instead
+                  </button>
+                </div>
+              )}
             </div>
           )}
           {status && !error && (
@@ -337,7 +343,7 @@ export default function App() {
         {result && styles && (
           <section className="mt-10 space-y-6">
             {/* Verdict Card */}
-            <div className={`border rounded-3xl p-6 sm:p-8 shadow-lg shadow-slate-200/50 ${styles.card}`}>
+            <div className={`border rounded-3xl p-6 sm:p-8 shadow-lg shadow-slate-200/50 print:shadow-none ${styles.card}`}>
               <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-6">
                 <div className="space-y-2">
                   <span className={`inline-flex items-center gap-2 px-3.5 py-1 rounded-full text-xs font-extrabold tracking-wider border ${styles.badge}`}>
@@ -374,20 +380,13 @@ export default function App() {
                     <span>•</span>
                     <span>{result.text_coverage_percent}% coverage</span>
                   </div>
-                  <div className="flex gap-2 mt-4">
+                  <div className="mt-4 no-print">
                     <button
                       type="button"
-                      onClick={() => window.print()}
-                      className="flex-1 px-3 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-semibold border border-slate-200 transition cursor-pointer"
+                      onClick={handleDownloadPdf}
+                      className="w-full px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition cursor-pointer"
                     >
-                      Print PDF
-                    </button>
-                    <button
-                      type="button"
-                      onClick={downloadReport}
-                      className="flex-1 px-3 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-semibold transition cursor-pointer"
-                    >
-                      Download MD
+                      Download PDF
                     </button>
                   </div>
                 </div>
@@ -395,7 +394,7 @@ export default function App() {
             </div>
 
             {/* Data Usage */}
-            <div className="bg-white border border-slate-200/90 rounded-3xl p-6 sm:p-7 shadow-sm">
+            <div className="bg-white border border-slate-200/90 rounded-3xl p-6 sm:p-7 shadow-sm print:shadow-none">
               <h3 className="text-xl font-bold text-slate-900 mb-1">Where & How Your Data Is Used</h3>
               <p className="text-xs text-slate-500 mb-5">Destinations, purposes and restriction signals detected</p>
               {result.data_usage?.length > 0 ? (
@@ -426,7 +425,7 @@ export default function App() {
             </div>
 
             {/* Findings */}
-            <div className="bg-white border border-slate-200/90 rounded-3xl p-6 sm:p-7 shadow-sm">
+            <div className="bg-white border border-slate-200/90 rounded-3xl p-6 sm:p-7 shadow-sm print:shadow-none">
               <h3 className="text-xl font-bold text-slate-900 mb-4">NLP & AI Risk Findings</h3>
               {result.findings?.length > 0 ? (
                 <div className="space-y-3">
@@ -451,7 +450,7 @@ export default function App() {
             </div>
 
             {/* Advice */}
-            <div className="bg-white border border-slate-200/90 rounded-3xl p-6 sm:p-7 shadow-sm">
+            <div className="bg-white border border-slate-200/90 rounded-3xl p-6 sm:p-7 shadow-sm print:shadow-none">
               <h3 className="text-lg font-bold text-slate-900 mb-3">Recommended Next Steps</h3>
               <ul className="list-disc list-inside space-y-2 text-sm text-slate-700">
                 {result.user_advice?.map((tip, idx) => (
