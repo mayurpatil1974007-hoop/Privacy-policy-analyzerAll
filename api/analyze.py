@@ -11,17 +11,13 @@ except ImportError:
 
 
 def try_ai_enrichment(text: str, nlp_result: dict) -> dict:
-    """Optional AI enrichment. Gracefully falls back if no key or any error."""
-    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("XAI_API_KEY")
+    """Optional Free Gemini enrichment. Gracefully falls back to NLP if no key or quota/error."""
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if not api_key:
         return nlp_result
 
-    base_url = "https://api.openai.com/v1"
-    model = "gpt-4o-mini"
-    if os.environ.get("XAI_API_KEY"):
-        base_url = "https://api.x.ai/v1"
-        model = "grok-beta"
-        api_key = os.environ.get("XAI_API_KEY")
+    model = (os.environ.get("GEMINI_MODEL") or "gemini-3.5-flash-lite").strip()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
 
     try:
         prompt = f"""You are a privacy policy risk analyst. Analyze the following privacy policy excerpt and return ONLY valid JSON with these keys:
@@ -32,27 +28,33 @@ def try_ai_enrichment(text: str, nlp_result: dict) -> dict:
 Policy text (truncated):
 {text[:6000]}
 """
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
         body = {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "You respond only with valid JSON. No markdown."},
-                {"role": "user", "content": prompt}
+            "contents": [
+                {
+                    "parts": [{"text": prompt}]
+                }
             ],
-            "temperature": 0.2,
-            "max_tokens": 500
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 500,
+                "responseMimeType": "application/json"
+            }
         }
-        resp = requests.post(f"{base_url}/chat/completions", headers=headers, json=body, timeout=20)
+        resp = requests.post(url, json=body, timeout=20)
         if resp.status_code != 200:
             return nlp_result
-        content = resp.json()["choices"][0]["message"]["content"]
+
+        data = resp.json()
+        content = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
         content = re.sub(r"^```json\s*|\s*```$", "", content.strip())
         ai_data = json.loads(content)
 
-        nlp_result["engine"] = "Hybrid NLP + AI"
+        nlp_result["engine"] = f"Hybrid NLP + Gemini ({model})"
         if ai_data.get("ai_summary"):
             nlp_result["summary"] = ai_data["ai_summary"]
         if ai_data.get("extra_risks"):
