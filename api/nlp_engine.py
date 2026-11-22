@@ -1,20 +1,14 @@
+import json
 import os
 import re
-import requests
+import urllib.error
+import urllib.request
 from bs4 import BeautifulSoup
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-try:
-    import torch
-    import torch.nn.functional as F
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    _TORCH_AVAILABLE = True
-except Exception:
-    _TORCH_AVAILABLE = False
-
-DEFAULT_HF_REPO_ID = "mayurpatil1974007/privacy-policy-risk-model"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 
 NEGATION_PATTERNS = [
     r"\bdo\s+not\b", r"\bdon't\b", r"\bdoes\s+not\b", r"\bdoesn't\b",
@@ -177,98 +171,6 @@ DATA_USAGE_RULES = [
     }
 ]
 
-_MODEL_BUNDLE = None
-_MODEL_LOAD_ATTEMPTED = False
-
-
-def _resolve_model_source() -> str | None:
-    env_path = (os.environ.get("PRIVACY_MODEL_DIR") or "").strip()
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    local_candidates = [
-        env_path,
-        os.path.join(base_dir, "final_privacy_model"),
-        os.path.join(base_dir, "..", "final_privacy_model"),
-        "./final_privacy_model",
-    ]
-    for path in local_candidates:
-        if path and os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json")):
-            return os.path.abspath(path)
-
-    hf_repo = (os.environ.get("HF_MODEL_REPO") or DEFAULT_HF_REPO_ID).strip()
-    return hf_repo or None
-
-
-def _get_legal_bert():
-    global _MODEL_BUNDLE, _MODEL_LOAD_ATTEMPTED
-    if _MODEL_LOAD_ATTEMPTED:
-        return _MODEL_BUNDLE
-    _MODEL_LOAD_ATTEMPTED = True
-
-    if not _TORCH_AVAILABLE:
-        return None
-
-    source = _resolve_model_source()
-    if not source:
-        return None
-
-    try:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        tokenizer = AutoTokenizer.from_pretrained(source)
-        model = AutoModelForSequenceClassification.from_pretrained(source).to(device)
-        model.eval()
-        _MODEL_BUNDLE = (tokenizer, model, device, source)
-        return _MODEL_BUNDLE
-    except Exception:
-        return None
-
-
-def _map_probs_to_color(p_low: float, p_med: float, p_high: float, low_threshold=0.35, high_threshold=0.50):
-    if p_high >= high_threshold and p_high >= p_low:
-        return "HIGH", "Red", "🔴", p_high * 100.0
-    if p_low >= low_threshold and p_low >= p_high * 0.8:
-        return "LOW", "Green", "🟢", p_low * 100.0
-    return "MEDIUM", "Yellow", "🟡", p_med * 100.0
-
-
-def predict_clauses_with_model(sentences: list[str]) -> tuple[list[dict], str | None]:
-    bundle = _get_legal_bert()
-    if not bundle or not sentences:
-        return [], None
-
-    tokenizer, model, device, source = bundle
-    try:
-        inputs = tokenizer(
-            sentences,
-            padding=True,
-            truncation=True,
-            max_length=256,
-            return_tensors="pt"
-        ).to(device)
-
-        with torch.no_grad():
-            logits = model(**inputs).logits
-            probs = F.softmax(logits, dim=-1).cpu().numpy()
-
-        clause_predictions = []
-        for sentence, prob in zip(sentences, probs):
-            p_low, p_med, p_high = float(prob[0]), float(prob[1]), float(prob[2])
-            risk, color, icon, score = _map_probs_to_color(p_low, p_med, p_high)
-            clause_predictions.append({
-                "clause": sentence,
-                "risk": risk,
-                "level": color,
-                "icon": icon,
-                "confidence": round(score, 1),
-                "probs": {
-                    "low": round(p_low * 100, 1),
-                    "medium": round(p_med * 100, 1),
-                    "high": round(p_high * 100, 1),
-                }
-            })
-        return clause_predictions, source
-    except Exception:
-        return [], None
-
 
 def _extract_clean_html_text(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
@@ -295,77 +197,30 @@ def fetch_url_text(url: str) -> str:
     if not cleaned.startswith(("http://", "https://")):
         cleaned = "https://" + cleaned
 
-    attempts = [
-        {
-            "headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/126.0.0.0 Safari/537.36"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            "verify": True,
-            "timeout": 7,
-        },
-        {
-            "headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                    "Version/17.5 Safari/605.1.15"
-                ),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-GB,en;q=0.8",
-            },
-            "verify": False,
-            "timeout": 8,
-        },
-    ]
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
 
-    last_err = None
-    with requests.Session() as session:
-        for cfg in attempts:
-            try:
-                resp = session.get(
-                    cleaned,
-                    headers=cfg["headers"],
-                    timeout=cfg["timeout"],
-                    allow_redirects=True,
-                    verify=cfg["verify"],
-                )
-                resp.raise_for_status()
-                text = _extract_clean_html_text(resp.text)
-                if len(text.split()) >= 25:
-                    return text
-                last_err = ValueError(
-                    "Not enough readable text extracted from this URL. "
-                    "The site may load via JavaScript or block bots. Try pasting the policy text or uploading a file."
-                )
-            except requests.exceptions.HTTPError as exc:
-                code = exc.response.status_code if exc.response is not None else "unknown"
-                if code in (401, 403, 429):
-                    last_err = ValueError(
-                        f"This website blocked automated URL access (HTTP {code}). "
-                        "Please paste the policy text or upload a PDF/file instead."
-                    )
-                    break
-                last_err = ValueError(
-                    f"Could not fetch this URL (HTTP {code}). Try pasting the policy text or uploading a file."
-                )
-            except requests.exceptions.Timeout:
-                last_err = ValueError(
-                    "The website took too long to respond. Try pasting the policy text or uploading a file."
-                )
-            except Exception:
-                last_err = ValueError(
-                    "Unable to read this URL automatically. Please paste the policy text or upload a file."
-                )
-
-    raise last_err or ValueError(
-        "Unable to read this URL automatically. Please paste the policy text or upload a file."
-    )
+    try:
+        req = urllib.request.Request(cleaned, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            html = resp.read().decode("utf-8", errors="ignore")
+            text = _extract_clean_html_text(html)
+            if len(text.split()) >= 25:
+                return text
+            raise ValueError(
+                "Not enough readable text extracted from this URL. "
+                "Try pasting the policy text instead."
+            )
+    except urllib.error.HTTPError as exc:
+        raise ValueError(f"Could not fetch this URL (HTTP {exc.code}). Try pasting the policy text.")
+    except Exception:
+        raise ValueError("Unable to read this URL automatically. Please paste the policy text.")
 
 
 def split_sentences(text: str):
@@ -406,6 +261,50 @@ def build_user_advice(level: str, data_usage: list) -> list:
 
     advice.append("This analysis is automated and is not legal advice.")
     return advice
+
+
+def _call_gemini_analysis(text: str) -> dict | None:
+    api_key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not api_key:
+        return None
+
+    model_name = (os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL).strip()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+
+    prompt = (
+        "Analyze the following privacy policy text and return ONLY valid JSON with keys:\n"
+        '{"risk_score": 0-100, "level": "Green"|"Yellow"|"Red", "summary": "...", '
+        '"findings": [{"category": "...", "status": "Risk"|"Conditional"|"Safe Note", "message": "...", "evidence": "..."}], '
+        '"advice": ["..."]}\n\n'
+        f"Policy text:\n{text[:12000]}"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.2},
+    }
+
+    try:
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        raw_text = (
+            body.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        ).strip()
+        if not raw_text:
+            return None
+        parsed = json.loads(raw_text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
 
 
 def analyze_nlp(text: str):
@@ -467,46 +366,70 @@ def analyze_nlp(text: str):
                     "evidence": sentence[:200] + ("..." if len(sentence) > 200 else "")
                 })
 
-    model_clauses, loaded_source = predict_clauses_with_model(sentences[:60])
-    red_count = sum(1 for c in model_clauses if c["level"] == "Red")
-    yellow_count = sum(1 for c in model_clauses if c["level"] == "Yellow")
-    green_count = sum(1 for c in model_clauses if c["level"] == "Green")
+    rule_score = max(0, min(score_points * 10, 100))
+    gemini_data = _call_gemini_analysis(text)
 
-    if model_clauses:
-        total_c = len(model_clauses)
-        model_risk_ratio = ((red_count * 1.0) + (yellow_count * 0.45)) / total_c
-        model_score = round(min(100, model_risk_ratio * 100))
-        rule_score = max(0, min(score_points * 10, 100))
-        risk_score = round(0.7 * model_score + 0.3 * rule_score)
+    if gemini_data:
+        g_score = gemini_data.get("risk_score")
+        if isinstance(g_score, (int, float)):
+            risk_score = max(0, min(100, round(float(g_score))))
+        else:
+            risk_score = rule_score
 
-        if red_count > 0 and risk_score < 50:
-            risk_score = max(risk_score, 55)
+        g_level = str(gemini_data.get("level") or "").strip().capitalize()
+        if g_level not in ("Red", "Yellow", "Green"):
+            g_level = "Red" if risk_score >= 50 else ("Yellow" if risk_score >= 20 else "Green")
+        level = g_level
 
-        for c in model_clauses[:15]:
-            findings.append({
-                "category": f"Model Clause ({c['icon']} {c['level']} · {c['confidence']}%)",
-                "status": c["risk"],
-                "weight_added": 2 if c["level"] == "Red" else (1 if c["level"] == "Yellow" else 0),
-                "message": f"Classified as {c['level']} ({c['risk']}) with {c['confidence']}% confidence.",
-                "evidence": c["clause"][:210] + ("..." if len(c["clause"]) > 210 else "")
-            })
-        engine_name = f"Fine-Tuned Legal-BERT ({loaded_source}) + NLP"
+        summary = str(gemini_data.get("summary") or "").strip() or (
+            "Significant privacy or data-sharing risks were detected in the policy."
+            if level == "Red"
+            else (
+                "Some tracking, sharing or conditional data terms were detected."
+                if level == "Yellow"
+                else "No major high-risk privacy clauses were detected in the analyzed text."
+            )
+        )
+
+        g_findings = gemini_data.get("findings")
+        if isinstance(g_findings, list) and g_findings:
+            cleaned_findings = []
+            for item in g_findings[:15]:
+                if isinstance(item, dict):
+                    cleaned_findings.append({
+                        "category": str(item.get("category") or "Gemini Clause Analysis"),
+                        "status": str(item.get("status") or "Risk"),
+                        "weight_added": 2 if level == "Red" else 1,
+                        "message": str(item.get("message") or ""),
+                        "evidence": str(item.get("evidence") or "")[:210],
+                    })
+            if cleaned_findings:
+                findings = cleaned_findings + findings
+
+        g_advice = gemini_data.get("advice")
+        advice = [str(a) for a in g_advice if a] if isinstance(g_advice, list) and g_advice else build_user_advice(level, data_usage)
+        engine_name = f"Gemini API ({os.environ.get('GEMINI_MODEL') or DEFAULT_GEMINI_MODEL}) + NLP"
     else:
-        risk_score = max(0, min(score_points * 10, 100))
-        engine_name = "Deterministic NLP (Model fallback)"
+        risk_score = rule_score
+        level = "Red" if risk_score >= 50 else ("Yellow" if risk_score >= 20 else "Green")
+        summary = (
+            "Significant privacy or data-sharing risks were detected in the policy."
+            if level == "Red"
+            else (
+                "Some tracking, sharing or conditional data terms were detected."
+                if level == "Yellow"
+                else "No major high-risk privacy clauses were detected in the analyzed text."
+            )
+        )
+        advice = build_user_advice(level, data_usage)
+        engine_name = "Deterministic NLP (Gemini fallback)"
 
-    if risk_score >= 50:
-        level = "Red"
+    if level == "Red":
         verdict = "HIGH RISK (Red)"
-        summary = "Significant privacy or data-sharing risks were detected in the policy."
-    elif risk_score >= 20:
-        level = "Yellow"
+    elif level == "Yellow":
         verdict = "MODERATE RISK (Yellow)"
-        summary = "Some tracking, sharing or conditional data terms were detected."
     else:
-        level = "Green"
         verdict = "GENERALLY SAFE (Green)"
-        summary = "No major high-risk privacy clauses were detected in the analyzed text."
 
     coverage = min(100, round((len(sentences) / 25) * 100)) if len(words) >= 25 else 20
 
@@ -518,17 +441,10 @@ def analyze_nlp(text: str):
         "summary": summary,
         "word_count": len(words),
         "sentences_analyzed": len(sentences),
-        "clause_breakdown": {
-            "red": red_count,
-            "yellow": yellow_count,
-            "green": green_count,
-            "total": len(model_clauses)
-        },
-        "clauses": model_clauses,
         "data_collected": extract_data_collected(text),
         "findings": findings,
         "data_usage": data_usage,
-        "user_advice": build_user_advice(level, data_usage),
+        "user_advice": advice,
         "engine": engine_name,
         "disclaimer": "This analysis is automated and is not legal advice."
     }
