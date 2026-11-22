@@ -1,9 +1,20 @@
+import os
 import re
 import requests
 from bs4 import BeautifulSoup
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+try:
+    import torch
+    import torch.nn.functional as F
+    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    _TORCH_AVAILABLE = True
+except Exception:
+    _TORCH_AVAILABLE = False
+
+DEFAULT_HF_REPO_ID = "mayurpatil1974007/privacy-policy-risk-model"
 
 NEGATION_PATTERNS = [
     r"\bdo\s+not\b", r"\bdon't\b", r"\bdoes\s+not\b", r"\bdoesn't\b",
@@ -165,6 +176,98 @@ DATA_USAGE_RULES = [
         "pattern": r"\b(delete\s+(your\s+)?(data|account)|opt[- ]?out|access\s+your\s+(data|information)|privacy\s+rights|withdraw\s+consent|rectification|portability)\b"
     }
 ]
+
+_MODEL_BUNDLE = None
+_MODEL_LOAD_ATTEMPTED = False
+
+
+def _resolve_model_source() -> str | None:
+    env_path = (os.environ.get("PRIVACY_MODEL_DIR") or "").strip()
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    local_candidates = [
+        env_path,
+        os.path.join(base_dir, "final_privacy_model"),
+        os.path.join(base_dir, "..", "final_privacy_model"),
+        "./final_privacy_model",
+    ]
+    for path in local_candidates:
+        if path and os.path.isdir(path) and os.path.isfile(os.path.join(path, "config.json")):
+            return os.path.abspath(path)
+
+    hf_repo = (os.environ.get("HF_MODEL_REPO") or DEFAULT_HF_REPO_ID).strip()
+    return hf_repo or None
+
+
+def _get_legal_bert():
+    global _MODEL_BUNDLE, _MODEL_LOAD_ATTEMPTED
+    if _MODEL_LOAD_ATTEMPTED:
+        return _MODEL_BUNDLE
+    _MODEL_LOAD_ATTEMPTED = True
+
+    if not _TORCH_AVAILABLE:
+        return None
+
+    source = _resolve_model_source()
+    if not source:
+        return None
+
+    try:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        tokenizer = AutoTokenizer.from_pretrained(source)
+        model = AutoModelForSequenceClassification.from_pretrained(source).to(device)
+        model.eval()
+        _MODEL_BUNDLE = (tokenizer, model, device, source)
+        return _MODEL_BUNDLE
+    except Exception:
+        return None
+
+
+def _map_probs_to_color(p_low: float, p_med: float, p_high: float, low_threshold=0.35, high_threshold=0.50):
+    if p_high >= high_threshold and p_high >= p_low:
+        return "HIGH", "Red", "🔴", p_high * 100.0
+    if p_low >= low_threshold and p_low >= p_high * 0.8:
+        return "LOW", "Green", "🟢", p_low * 100.0
+    return "MEDIUM", "Yellow", "🟡", p_med * 100.0
+
+
+def predict_clauses_with_model(sentences: list[str]) -> tuple[list[dict], str | None]:
+    bundle = _get_legal_bert()
+    if not bundle or not sentences:
+        return [], None
+
+    tokenizer, model, device, source = bundle
+    try:
+        inputs = tokenizer(
+            sentences,
+            padding=True,
+            truncation=True,
+            max_length=256,
+            return_tensors="pt"
+        ).to(device)
+
+        with torch.no_grad():
+            logits = model(**inputs).logits
+            probs = F.softmax(logits, dim=-1).cpu().numpy()
+
+        clause_predictions = []
+        for sentence, prob in zip(sentences, probs):
+            p_low, p_med, p_high = float(prob[0]), float(prob[1]), float(prob[2])
+            risk, color, icon, score = _map_probs_to_color(p_low, p_med, p_high)
+            clause_predictions.append({
+                "clause": sentence,
+                "risk": risk,
+                "level": color,
+                "icon": icon,
+                "confidence": round(score, 1),
+                "probs": {
+                    "low": round(p_low * 100, 1),
+                    "medium": round(p_med * 100, 1),
+                    "high": round(p_high * 100, 1),
+                }
+            })
+        return clause_predictions, source
+    except Exception:
+        return [], None
 
 
 def _extract_clean_html_text(html: str) -> str:
@@ -364,7 +467,33 @@ def analyze_nlp(text: str):
                     "evidence": sentence[:200] + ("..." if len(sentence) > 200 else "")
                 })
 
-    risk_score = max(0, min(score_points * 10, 100))
+    model_clauses, loaded_source = predict_clauses_with_model(sentences[:60])
+    red_count = sum(1 for c in model_clauses if c["level"] == "Red")
+    yellow_count = sum(1 for c in model_clauses if c["level"] == "Yellow")
+    green_count = sum(1 for c in model_clauses if c["level"] == "Green")
+
+    if model_clauses:
+        total_c = len(model_clauses)
+        model_risk_ratio = ((red_count * 1.0) + (yellow_count * 0.45)) / total_c
+        model_score = round(min(100, model_risk_ratio * 100))
+        rule_score = max(0, min(score_points * 10, 100))
+        risk_score = round(0.7 * model_score + 0.3 * rule_score)
+
+        if red_count > 0 and risk_score < 50:
+            risk_score = max(risk_score, 55)
+
+        for c in model_clauses[:15]:
+            findings.append({
+                "category": f"Model Clause ({c['icon']} {c['level']} · {c['confidence']}%)",
+                "status": c["risk"],
+                "weight_added": 2 if c["level"] == "Red" else (1 if c["level"] == "Yellow" else 0),
+                "message": f"Classified as {c['level']} ({c['risk']}) with {c['confidence']}% confidence.",
+                "evidence": c["clause"][:210] + ("..." if len(c["clause"]) > 210 else "")
+            })
+        engine_name = f"Fine-Tuned Legal-BERT ({loaded_source}) + NLP"
+    else:
+        risk_score = max(0, min(score_points * 10, 100))
+        engine_name = "Deterministic NLP (Model fallback)"
 
     if risk_score >= 50:
         level = "Red"
@@ -389,10 +518,17 @@ def analyze_nlp(text: str):
         "summary": summary,
         "word_count": len(words),
         "sentences_analyzed": len(sentences),
+        "clause_breakdown": {
+            "red": red_count,
+            "yellow": yellow_count,
+            "green": green_count,
+            "total": len(model_clauses)
+        },
+        "clauses": model_clauses,
         "data_collected": extract_data_collected(text),
         "findings": findings,
         "data_usage": data_usage,
         "user_advice": build_user_advice(level, data_usage),
-        "engine": "Deterministic NLP",
-        "disclaimer": "This NLP analysis reflects text patterns found in the provided policy and cannot guarantee actual runtime or hidden backend behavior. Not legal advice."
+        "engine": engine_name,
+        "disclaimer": "This analysis is automated and is not legal advice."
     }
